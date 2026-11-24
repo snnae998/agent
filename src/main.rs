@@ -1,6 +1,7 @@
 //! monitor-agent: reports one Linux host to a monitor hub over WebSocket.
 
 mod collect;
+mod songzhong;
 
 use std::time::Duration;
 
@@ -358,6 +359,7 @@ async fn session(
     send(&mut ws, notify("hello", &facts)?, remaining(last_frame)).await?;
 
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
+    let sz_handle = tokio::spawn(songzhong_loop(result_tx.clone(), stagger_seed(token)));
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     let mut ticker = tokio::time::interval(Duration::from_secs(interval));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -431,10 +433,46 @@ async fn session(
         }
     };
 
+    sz_handle.abort();
     for (_, handle) in ping_tasks {
         handle.abort();
     }
     result
+}
+
+/// How often the 送中 self-check runs. The verdict it reports changes when
+/// an operator reroutes a node's egress or a carrier changes a prefix's
+/// geo-location -- a matter of days, not seconds -- so six hours tracks it
+/// without spending the node's traffic or YouTube's patience on re-asking.
+const SONGZHONG_INTERVAL: Duration = Duration::from_secs(6 * 3600);
+
+/// A per-node spread for the first check, derived from the token: the one
+/// value every node has and no two nodes share. Without it a hub restart
+/// reconnects the whole fleet at once and every agent asks YouTube in the
+/// same minute, which reads as a burst from a single operator.
+fn stagger_seed(token: &str) -> u64 {
+    token.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
+}
+
+/// The 送中 loop: one check per [`SONGZHONG_INTERVAL`], each reported as a
+/// `songzhong.result` frame over the session's result channel, in the same
+/// shape as a ping result. The check itself is blocking HTTP, so it runs on
+/// a blocking thread; a session that ends aborts the loop with the socket,
+/// and a check in flight simply never reports.
+async fn songzhong_loop(tx: mpsc::Sender<Message>, seed: u64) {
+    tokio::time::sleep(Duration::from_secs(120 + seed % 1800)).await;
+    loop {
+        let Ok(result) = tokio::task::spawn_blocking(songzhong::run_check).await else {
+            return;
+        };
+        let Ok(msg) = notify("songzhong.result", &result) else {
+            return;
+        };
+        if tx.send(msg).await.is_err() {
+            return;
+        }
+        tokio::time::sleep(SONGZHONG_INTERVAL).await;
+    }
 }
 
 /// Opens the TCP connection to the hub, trying its addresses in turn.
