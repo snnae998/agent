@@ -3,6 +3,7 @@
 mod collect;
 mod songzhong;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 // Shares the clock `tokio::time::timeout` and `sleep` read, so deadline
@@ -14,7 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{Sink, SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
@@ -230,6 +231,16 @@ async fn main() -> Result<()> {
         "counting traffic on: {}",
         if counted.is_empty() { "none".to_owned() } else { counted.join(" ") }
     );
+    // The 送中 schedule runs on the process, not inside a session: see
+    // `songzhong_scheduler`. Spawned before the first connection attempt so
+    // its clock starts with the process and a link that cannot stay up long
+    // enough to reach the hub still gets its checks run.
+    let songzhong = Arc::new(SongzhongOutbox::new());
+    tokio::spawn(songzhong_scheduler(songzhong.clone(), stagger_seed(&args.token)));
+    // The `checked` of the newest 送中 result a session has handed to the
+    // hub, held across sessions so a result delivered once is not sent again
+    // on the next reconnect -- and one never delivered is not forgotten.
+    let mut songzhong_sent = 0i64;
     let mut wait = 0u64;
 
     loop {
@@ -238,7 +249,17 @@ async fn main() -> Result<()> {
         // that ran. `None` means never connected, which keeps the backoff
         // doubling.
         let mut connected = None;
-        if let Err(e) = session(&url, &args.token, &mut collector, args.interval, &mut connected).await {
+        if let Err(e) = session(
+            &url,
+            &args.token,
+            &mut collector,
+            args.interval,
+            &mut connected,
+            &songzhong,
+            &mut songzhong_sent,
+        )
+        .await
+        {
             eprintln!("session ended: {}", causes(&e));
         }
         wait = reconnect_wait(wait, connected.map_or(Duration::ZERO, |t: Instant| t.elapsed()));
@@ -317,6 +338,8 @@ async fn session(
     collector: &mut Collector,
     interval: u64,
     connected: &mut Option<Instant>,
+    songzhong: &SongzhongOutbox,
+    songzhong_sent: &mut i64,
 ) -> Result<()> {
     let request = authorized(url, token)?;
     let config =
@@ -363,8 +386,22 @@ async fn session(
     }
     send(&mut ws, notify("hello", hello), remaining(last_frame)).await?;
 
+    // The 送中 handover. Subscribed and marked unchanged before the outbox
+    // is read, so a result stored from here on either is in that read or
+    // wakes the `changed` branch below -- never neither.
+    let mut sz_rx = songzhong.subscribe();
+    sz_rx.mark_unchanged();
+    // A result completed while no session was up, or one a previous session
+    // died before taking, goes out with the hello: a node whose link flaps
+    // still delivers every verdict, one reconnect late at worst.
+    if let Some(result) = songzhong.pending(*songzhong_sent) {
+        if let Ok(params) = serde_json::to_value(&result) {
+            send(&mut ws, notify("songzhong.result", params), remaining(last_frame)).await?;
+            *songzhong_sent = result.checked;
+        }
+    }
+
     let (result_tx, mut result_rx) = mpsc::channel::<Message>(64);
-    let sz_handle = tokio::spawn(songzhong_loop(result_tx.clone(), stagger_seed(token)));
     let mut ping_tasks: Vec<(PingTask, tokio::task::JoinHandle<()>)> = Vec::new();
     // The baseline is taken a second before the first report, which then
     // measures CPU and network over that second rather than over nothing --
@@ -404,6 +441,16 @@ async fn session(
             Some(msg) = result_rx.recv() => {
                 if let Err(e) = send(&mut ws, msg, remaining(last_frame)).await { break Err(e); }
             }
+            // A 送中 result completed during this session goes out now
+            // rather than at the next reconnect. Whether it is owed is the
+            // outbox's call, the same one the handover above made.
+            Ok(()) = sz_rx.changed() => {
+                if let Some(result) = songzhong.pending(*songzhong_sent) {
+                    let Ok(params) = serde_json::to_value(&result) else { continue };
+                    if let Err(e) = send(&mut ws, notify("songzhong.result", params), remaining(last_frame)).await { break Err(e); }
+                    *songzhong_sent = result.checked;
+                }
+            }
             incoming = ws.next() => {
                 // Any frame proves the path alive, including the hub's
                 // heartbeat ping -- the only one on an otherwise idle link.
@@ -428,7 +475,6 @@ async fn session(
         }
     };
 
-    sz_handle.abort();
     for (_, handle) in ping_tasks {
         handle.abort();
     }
@@ -449,25 +495,71 @@ fn stagger_seed(token: &str) -> u64 {
     token.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(u64::from(b)))
 }
 
-/// The 送中 loop: one check per [`SONGZHONG_INTERVAL`], each reported as a
-/// `songzhong.result` frame over the session's result channel, in the same
-/// shape as a ping result. The check itself is blocking HTTP, so it runs on
-/// a blocking thread; a session that ends aborts the loop with the socket,
-/// and a check in flight simply never reports.
-async fn songzhong_loop(tx: mpsc::Sender<Message>, seed: u64) {
-    tokio::time::sleep(Duration::from_secs(120 + seed % 1800)).await;
+/// The newest completed 送中 result, held between sessions.
+///
+/// Only the latest is kept: the hub renders the newest verdict it has, so a
+/// result overtaken by a fresher check before any session could take it has
+/// nothing left to say. A watch channel carries it because a session needs
+/// both halves of the handover -- the value as it stands when the session
+/// opens, and a wake-up when a fresher one lands mid-session.
+struct SongzhongOutbox {
+    tx: watch::Sender<Option<songzhong::SongzhongResult>>,
+}
+
+impl SongzhongOutbox {
+    fn new() -> Self {
+        Self { tx: watch::channel(None).0 }
+    }
+
+    /// Leaves a freshly completed result for the next handover, replacing
+    /// the one before it and waking any session waiting on a change.
+    fn store(&self, result: songzhong::SongzhongResult) {
+        self.tx.send_replace(Some(result));
+    }
+
+    /// Watches for results stored from now on.
+    fn subscribe(&self) -> watch::Receiver<Option<songzhong::SongzhongResult>> {
+        self.tx.subscribe()
+    }
+
+    /// The stored result a session still owes the hub: one whose `checked`
+    /// is newer than the newest already handed over. `checked` is the dedup
+    /// key because it names the check itself, not a delivery attempt: once a
+    /// session has written a result out, that check is not sent again, and
+    /// the next check supersedes it within the interval in any case.
+    fn pending(&self, sent: i64) -> Option<songzhong::SongzhongResult> {
+        self.tx.borrow().clone().filter(|result| result.checked > sent)
+    }
+}
+
+/// The 送中 scheduler: one check per [`SONGZHONG_INTERVAL`] for the life of
+/// the process, each left in the outbox for a session to carry to the hub as
+/// a `songzhong.result` frame. The check itself is blocking HTTP, so it runs
+/// on a blocking thread.
+///
+/// The schedule deliberately does not live inside a session. It used to --
+/// spawned per connection, aborted with it -- so the first check had to wait
+/// out its stagger in unbroken session time. On a node whose tunnel resets
+/// every few minutes (Taipei101-LAX1 logged eleven session ends in two
+/// hours) no session ever lasted the stagger out, and the node simply never
+/// had a verdict for the hub to show. A process-level clock is immune: the
+/// check runs whether or not a session is up, and the outbox holds the
+/// result until one is.
+async fn songzhong_scheduler(outbox: Arc<SongzhongOutbox>, seed: u64) {
+    tokio::time::sleep(stagger_delay(seed)).await;
     loop {
         let Ok(result) = tokio::task::spawn_blocking(songzhong::run_check).await else {
             return;
         };
-        let Ok(params) = serde_json::to_value(&result) else {
-            return;
-        };
-        if tx.send(notify("songzhong.result", params)).await.is_err() {
-            return;
-        }
+        outbox.store(result);
         tokio::time::sleep(SONGZHONG_INTERVAL).await;
     }
+}
+
+/// The first check's delay: a two-minute floor plus the node's share of the
+/// half-hour spread [`stagger_seed`] deals out.
+fn stagger_delay(seed: u64) -> Duration {
+    Duration::from_secs(120 + seed % 1800)
 }
 
 /// The upgrade request for `url`, carrying the node's token.
@@ -1084,5 +1176,43 @@ mod tests {
         let flood = (0..500).map(|id| task(id, "f:6", 60)).collect();
         respawn_ping_tasks(&mut running, flood, &tx);
         assert_eq!(running.len(), MAX_PING_TASKS, "the hub does not choose how many probes run");
+    }
+
+    fn sz_result(checked: i64) -> songzhong::SongzhongResult {
+        songzhong::SongzhongResult {
+            v4: "ok".into(),
+            v4_region: "US".into(),
+            v6: "none".into(),
+            v6_region: String::new(),
+            ip4: "192.0.2.1".into(),
+            ip6: String::new(),
+            checked,
+        }
+    }
+
+    /// The first check's delay is the two-minute floor plus the node's share
+    /// of the half-hour spread, and no seed deals out more than the spread.
+    #[test]
+    fn the_first_songzhong_check_waits_out_the_stagger() {
+        assert_eq!(stagger_delay(0), Duration::from_secs(120));
+        assert_eq!(stagger_delay(1799), Duration::from_secs(120 + 1799));
+        assert_eq!(stagger_delay(1800), Duration::from_secs(120), "the spread wraps within its window");
+        assert!(stagger_delay(u64::MAX) < Duration::from_secs(120 + 1800));
+    }
+
+    /// A session is handed exactly the stored results newer than the newest
+    /// it has already sent: nothing before the first check completes, the
+    /// result once it does, nothing again until a fresher check replaces it.
+    #[test]
+    fn the_outbox_hands_over_only_what_a_session_has_not_sent() {
+        let outbox = SongzhongOutbox::new();
+        assert!(outbox.pending(0).is_none(), "no check has completed yet");
+        outbox.store(sz_result(100));
+        assert_eq!(outbox.pending(0).map(|r| r.checked), Some(100));
+        assert!(outbox.pending(100).is_none(), "already handed over");
+        assert!(outbox.pending(200).is_none(), "older than what was sent");
+        outbox.store(sz_result(150));
+        assert_eq!(outbox.pending(100).map(|r| r.checked), Some(150), "the newest replaces the stored one");
+        assert!(outbox.pending(150).is_none());
     }
 }

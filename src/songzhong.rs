@@ -43,8 +43,9 @@ const BODY_CAP: u64 = 4 << 20;
 /// One check's outcome, in the shape the hub reads by name. Statuses are
 /// `ok`, `cn`, `fail`, `none` per stack; a region is set only for `ok`
 /// (the country YouTube sees, `??` when the page does not say) and `cn`
-/// (always `CN`).
-#[derive(Serialize)]
+/// (always `CN`). Clone so a finished result can sit in the outbox in
+/// `main.rs` while sessions come and go underneath it.
+#[derive(Serialize, Clone)]
 pub struct SongzhongResult {
     pub v4: String,
     pub v4_region: String,
